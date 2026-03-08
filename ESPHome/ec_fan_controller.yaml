@@ -1,0 +1,339 @@
+esphome:
+  name: ec-fan-controller
+  friendly_name: "EC Fan Controller"
+  platformio_options:
+    board_build.flash_size: 4MB
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/lboue/esphome
+      ref: adc_oneshot
+    components: [ adc ]
+    refresh: 0s # Do not update automatically
+
+esp32:
+  board: esp32-c6-devkitm-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHSIZE_4MB: y
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA
+  fast_connect: true
+
+  ap:
+    ssid: "EC Fan Fallback Hotspot"
+    password: !secret fallback_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 2
+  auth:
+    username: !secret admin_username
+    password: !secret admin_password
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+
+api:
+  encryption:
+    key: !secret ha_hash
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+  id: my_ota
+
+# I2C configuration for SHT41
+i2c:
+  sda: 6
+  scl: 7
+
+globals:
+  - id: last_on_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+  - id: last_off_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+  - id: brightness_scale
+    type: float
+    restore_value: yes
+    initial_value: '0.6'
+  - id: last_speed
+    type: float
+    restore_value: yes
+    initial_value: '0.3'   # 30 % default
+
+sensor:
+  - platform: sht4x
+    temperature:
+      name: "Temperature"
+      id: sht41_temperature
+      accuracy_decimals: 3
+      on_value:
+        then:
+          - light.addressable_set:
+              id: status_led
+              red: !lambda |-
+                float r = 0;
+                if (x < id(min_temp).state) {
+                  r = 0.0;
+                } else if (x > id(max_temp).state) {
+                  r = 1.0;
+                } else {
+                  r = (x - id(min_temp).state) / (id(max_temp).state - id(min_temp).state);
+                }
+                return r * id(brightness_scale);
+              green: !lambda |-
+                float g = 0;
+                if (x < 0) {
+                  g = 0.0;
+                } else if (x < id(min_temp).state) {
+                  g = x / id(min_temp).state;
+                } else if (x > id(max_temp).state) {
+                  g = 0.0;
+                } else {
+                  g = (id(max_temp).state - x) / (id(max_temp).state - id(min_temp).state);
+                }
+                return g * id(brightness_scale);
+              blue: !lambda |-
+                float b = 0;
+                if (x < 0) {
+                  b = 1.0;
+                } else if (x < id(min_temp).state) {
+                  b = (id(min_temp).state - x) / id(min_temp).state;
+                } else {
+                  b = 0.0;
+                }
+                return b * id(brightness_scale);
+    humidity:
+      name: "Humidity"
+      id: sht41_humidity
+      accuracy_decimals: 3
+    address: 0x44
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: 9
+      mode: INPUT_PULLUP
+      inverted: True
+    id: button_1
+    on_press:
+      then:
+        - lambda: |-
+            auto call = id(fan_speed_control).toggle();
+            call.perform();
+
+light:
+  - platform: esp32_rmt_led_strip
+    rgb_order: GRB
+    pin: 8
+    num_leds: 1
+    chipset: ws2812
+    id: status_led
+    gamma_correct: 2.8
+
+output:
+  - platform: ledc
+    pin: 4
+    frequency: 5000 Hz
+    id: fan_pwm
+  - platform: template
+    id: current_speed
+    type: float
+    write_action:
+      - lambda: |-
+          // placeholder
+
+switch:
+  - platform: restart
+    name: "Restart"
+
+  - platform: template
+    name: "Automatic Mode"
+    id: automatic_mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+fan:
+  - platform: speed
+    output: current_speed
+    name: "Fan Speed Control"
+    speed_count: 100
+    id: fan_speed_control
+    restore_mode: RESTORE_DEFAULT_OFF
+    icon: "mdi:fan"
+    on_turn_on:
+      then:
+
+        - lambda: |-
+            id(fan_pwm).set_level(id(last_speed));
+            ESP_LOGD("fan_control", "Restoring last speed %.0f%%", id(last_speed)*100);
+    on_turn_off:
+      then:
+        - lambda: |-
+            id(fan_pwm).set_level(0);
+    on_speed_set:
+      then:
+        - if:
+            condition:
+              lambda: 'return ( id(fan_speed_control).state && x >= 1 );'
+            then:
+              - lambda: |-
+                  const float FAN_MIN_PWM = 11.0;
+                  const float FAN_MAX_PWM = 100.0;
+                  float pwm_speed = FAN_MIN_PWM + (x - 1.0) * (FAN_MAX_PWM - FAN_MIN_PWM) / (FAN_MAX_PWM - 1);
+                  id(fan_pwm).set_level(pwm_speed / 100.0);
+                  id(last_speed) = pwm_speed / 100.0;
+                  ESP_LOGD("fan_control", "PWM set to %.0f%%", pwm_speed);
+            else:
+              - lambda: |-
+                  id(fan_pwm).set_level(0);
+                  ESP_LOGD("fan_control", "PWM set to 0%%");
+              - fan.turn_off: fan_speed_control
+
+number:
+  - platform: template
+    name: "LED Max Brightness"
+    id: led_max_brightness
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true
+    mode: slider
+    on_value:
+      then:
+        - lambda: |-
+            id(brightness_scale) = x * 0.01;
+  - platform: template
+    name: "Min Limit"
+    id: min_temp
+    device_class: temperature
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 40
+    step: 0.5
+    unit_of_measurement: "°C"
+    on_value:
+      - lambda: |-
+          if (id(min_temp).state > id(max_temp).state) {
+            id(max_temp).publish_state(id(min_temp).state);
+          }
+  - platform: template
+    name: "Max Limit"
+    id: max_temp
+    device_class: temperature
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 50
+    step: 0.5
+    unit_of_measurement: "°C"
+    on_value:
+      - lambda: |-
+          if (id(max_temp).state < id(min_temp).state) {
+            id(min_temp).publish_state(id(max_temp).state);
+          }
+  - platform: template
+    name: "Min Run Time (min)"
+    id: min_run_time
+    device_class: duration
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 60
+    step: 1
+    unit_of_measurement: "min"
+  - platform: template
+    name: "Min Off Time (min)"
+    id: min_off_time
+    device_class: duration
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 60
+    step: 1
+    unit_of_measurement: "min"
+
+interval:
+  - interval: 6s
+    then:
+      - if:
+          condition:
+            switch.is_on: automatic_mode
+          then:
+            - lambda: |-
+                unsigned long now = millis();
+                float temp = id(sht41_temperature).state;
+                float min_temperature = id(min_temp).state;
+                float max_temperature = id(max_temp).state;
+                float current_speed = id(fan_speed_control).speed;
+                if (!id(fan_speed_control).state) current_speed = 0;
+                float speed = current_speed;
+                if (temp < min_temperature) {
+                  // basic hysteresis
+                  if ( (temp >= min_temperature - 1) || (current_speed > 1) ) {
+                    speed = (current_speed > 0) ? (current_speed > 1) ? current_speed - 1 : 1 : 0;
+                  } else {
+                    speed = 0;
+                  }
+                } else {
+                  if (temp > max_temperature) {
+                    speed = 100.0;
+                  } else {
+                    speed = round( (temp - min_temperature) / (max_temperature - min_temperature) * 100.0 );
+                  }
+                }
+                if (isnan(temp)) {
+                  speed = 50;
+                }
+                if (fabs(speed - current_speed) >= 1) {
+                  ESP_LOGD("fan_control", "Evaluating change of the speed from %.0f to %.0f", current_speed, speed);
+                  bool allow_change = true;
+
+                  if (speed > 0 && current_speed == 0) {
+                    unsigned long elapsed_off = (now - id(last_off_time)) / 60000;
+                    ESP_LOGV("fan_control", "Last Off Time: %i", id(last_off_time));
+                    ESP_LOGV("fan_control", "Now: %i", now);
+                    ESP_LOGV("fan_control", "Time diff (off): %i", elapsed_off);
+                    if (id(last_off_time) != 0 && elapsed_off < id(min_off_time).state) {
+                      allow_change = false;
+                      ESP_LOGD("fan_control", "Time diff: %i minutes. Waiting for %i minutes to turn the fan on.", elapsed_off, id(min_off_time).state);
+                    } else {
+                      id(last_on_time) = millis();
+                    }
+                  }
+                  if (speed == 0 && current_speed > 0) {
+                    unsigned long elapsed_on = (now - id(last_on_time)) / 60000;
+                    ESP_LOGV("fan_control", "Last On Time: %i", id(last_on_time));
+                    ESP_LOGV("fan_control", "Now: %i", now);
+                    ESP_LOGV("fan_control", "Time diff (on): %i", elapsed_on);
+                    if (id(last_on_time) != 0 && elapsed_on < id(min_run_time).state) {
+                      allow_change = false;
+                      ESP_LOGD("fan_control", "Time diff: %i minutes. Waiting for %i minutes to turn the fan off.", elapsed_on, id(min_run_time).state);
+                    } else {
+                      id(last_off_time) = millis();
+                    }
+                  }
+
+                  if (allow_change) {
+                    auto call = (speed > 0) ? id(fan_speed_control).turn_on() : id(fan_speed_control).turn_off();
+                    call.set_speed(speed);
+                    call.perform();
+                  }
+                }
